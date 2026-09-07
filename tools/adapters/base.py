@@ -235,6 +235,93 @@ def split_tools_list(raw) -> list[str]:
     return []
 
 
+# ── YAML frontmatter emission ─────────────────────────────────────────────────
+
+_YAML_SPECIAL_LEADS = (
+    "[",
+    "{",
+    "*",
+    "&",
+    "!",
+    "|",
+    ">",
+    "'",
+    '"',
+    "@",
+    "`",
+    "#",
+    "%",
+    ",",
+    "?",
+    ":",
+    "-",
+)
+
+# YAML 1.1 implicit booleans/null — must be quoted to avoid being interpreted as bool/None.
+# YAML 1.2 narrowed this list, but PyYAML's default is still 1.1 (and many consumers are
+# affected); quote conservatively.
+_YAML_RESERVED_WORDS = frozenset(
+    {
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "null",
+        "~",
+        "True",
+        "False",
+        "Yes",
+        "No",
+        "On",
+        "Off",
+        "Null",
+        "TRUE",
+        "FALSE",
+        "YES",
+        "NO",
+        "ON",
+        "OFF",
+        "NULL",
+    }
+)
+
+
+def yaml_scalar(value: object) -> str:
+    """Render a value as a YAML scalar, quoting when needed to avoid ambiguity.
+
+    Every adapter that writes frontmatter must route scalars through here. Emitting a
+    bare value that YAML cannot parse produces a file the target harness rejects at
+    load, and the repo's own validators use `parse_frontmatter` (a tolerant hand-rolled
+    reader) rather than a YAML parser, so they will not catch it.
+
+    Quotes when the value:
+    - is empty / pure whitespace
+    - starts with a YAML special character
+    - contains `:` followed by whitespace (would be interpreted as a key)
+    - contains ` #` (would be interpreted as a comment)
+    - has leading or trailing whitespace
+    - starts with a digit (number-like)
+    - matches a YAML 1.1 implicit-boolean/null reserved word
+    """
+    s = str(value).replace("\n", " ")
+    needs_quote = (
+        s == ""
+        or s != s.strip()
+        or s.startswith(_YAML_SPECIAL_LEADS)
+        or ": " in s
+        or " #" in s
+        or s[:1].isdigit()
+        or s in _YAML_RESERVED_WORDS
+    )
+    if needs_quote:
+        # Use double quotes; escape embedded double-quotes and backslashes.
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
 # ── Source-of-truth dataclasses ───────────────────────────────────────────────
 
 

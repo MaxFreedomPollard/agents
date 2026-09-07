@@ -11,15 +11,13 @@ import json
 import re
 from pathlib import Path
 
+import yaml
+
 # tools.adapters.* imports happen via the conftest sys.path injection
 from tools.adapters.antigravity import AntigravityAdapter
-from tools.adapters.base import PluginSource, parse_frontmatter
+from tools.adapters.base import PluginSource, parse_frontmatter, yaml_scalar
 from tools.adapters.codex import CodexAdapter, _split_body_if_oversized
-from tools.adapters.copilot import (
-    CopilotAdapter,
-    _build_tools_list,
-    _needs_yaml_quoting,
-)
+from tools.adapters.copilot import CopilotAdapter, _build_tools_list
 from tools.adapters.cursor import CursorAdapter
 from tools.adapters.opencode import OpenCodeAdapter, _opencode_skill_id
 
@@ -1352,20 +1350,6 @@ class TestCopilotAdapter:
         assert _build_tools_list(["CustomTool"]) == ["CustomTool"]
         assert _build_tools_list([]) == []
 
-    def test_yaml_quoting(self):
-        assert _needs_yaml_quoting("123")
-        assert _needs_yaml_quoting("3.14")
-        assert _needs_yaml_quoting("true")
-        assert _needs_yaml_quoting("false")
-        assert _needs_yaml_quoting("yes")
-        assert _needs_yaml_quoting("no")
-        assert _needs_yaml_quoting("on")
-        assert _needs_yaml_quoting("off")
-        assert _needs_yaml_quoting("null")
-        assert _needs_yaml_quoting("~")
-        assert not _needs_yaml_quoting("hello world")
-        assert not _needs_yaml_quoting("Use when testing.")
-
     def test_explicit_empty_tools(self, tmp_path: Path, output_root: Path):
         from tools.tests.conftest import _make_agent
 
@@ -1415,6 +1399,131 @@ class TestCopilotAdapter:
         assert fm["description"] == "Use when unrestricted."
         assert fm["model"] == "claude-opus-4.8"
         assert "tools" not in fm
+
+
+# ── Cross-cutting: emitted frontmatter must parse as YAML ────────────────────
+
+# Both values are shapes that exist in the repo today: `conductor:manage` has a colon
+# in its description, and `agent-teams:team-delegate` has a bracketed argument hint.
+# Their source files quote them correctly, so an adapter that drops the quotes turns
+# valid source into an artifact the target harness cannot load.
+_COLON_DESCRIPTION = "Manage track lifecycle: archive, restore, delete"
+_BRACKET_HINT = "[--archive | --restore | --list]"
+
+
+def _ambiguous_plugin(tmp_path: Path) -> PluginSource:
+    """A one-command plugin whose frontmatter needs quoting to stay parseable."""
+    from tools.tests.conftest import _make_command
+
+    plugin_json = {"name": "demo", "description": _COLON_DESCRIPTION}
+    plugin_dir = tmp_path / "demo"
+    plugin_dir.mkdir()
+    (plugin_dir / ".claude-plugin").mkdir()
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(json.dumps(plugin_json))
+    command = _make_command(
+        plugin_dir,
+        "manage",
+        f'description: "{_COLON_DESCRIPTION}"\nargument-hint: "{_BRACKET_HINT}"',
+        "# Manage\n\nBody.\n",
+    )
+    return PluginSource(name="demo", dir=plugin_dir, plugin_json=plugin_json, commands=[command])
+
+
+def _safe_load_frontmatter(path: Path) -> dict:
+    """Parse a generated file's frontmatter with a real YAML parser."""
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), f"{path} has no frontmatter"
+    end = text.index("\n---", 3)
+    loaded = yaml.safe_load(text[4:end])
+    assert isinstance(loaded, dict), f"{path} frontmatter is not a mapping: {loaded!r}"
+    return loaded
+
+
+class TestFrontmatterYamlSafety:
+    """Every adapter must emit frontmatter a real YAML parser accepts.
+
+    `parse_frontmatter` is a tolerant hand-rolled reader, so the repo's own validators
+    accept output that PyYAML rejects. These tests use PyYAML directly.
+    """
+
+    def test_yaml_scalar_round_trips_ambiguous_values(self):
+        for value in (
+            _COLON_DESCRIPTION,
+            _BRACKET_HINT,
+            "",
+            "  padded  ",
+            "true",
+            "false",
+            "yes",
+            "NO",
+            "on",
+            "off",
+            "null",
+            "~",
+            "123",
+            "3.14",
+            "- leading dash",
+            "trailing # hash",
+            'has "quotes" and \\ backslash',
+        ):
+            assert yaml.safe_load(f"k: {yaml_scalar(value)}") == {"k": value}
+
+    def test_yaml_scalar_leaves_plain_values_unquoted(self):
+        for value in ("hello world", "Use when testing.", "claude-sonnet-5"):
+            assert yaml_scalar(value) == value
+
+    def test_copilot_emits_parseable_frontmatter(self, tmp_path: Path, output_root: Path):
+        plugin = _ambiguous_plugin(tmp_path)
+        result = CopilotAdapter(output_root=output_root).emit_plugin(plugin)
+
+        emitted = [p for p in result.written if p.suffix == ".md"]
+        assert emitted
+        for path in emitted:
+            fm = _safe_load_frontmatter(path)
+            assert fm["description"] == _COLON_DESCRIPTION
+            if "argument-hint" in fm:
+                assert fm["argument-hint"] == _BRACKET_HINT
+
+    def test_opencode_emits_parseable_frontmatter(self, tmp_path: Path, output_root: Path):
+        plugin = _ambiguous_plugin(tmp_path)
+        result = OpenCodeAdapter(output_root=output_root).emit_plugin(plugin)
+
+        emitted = [p for p in result.written if p.suffix == ".md"]
+        assert emitted
+        for path in emitted:
+            fm = _safe_load_frontmatter(path)
+            assert fm["description"] == _COLON_DESCRIPTION
+            assert fm["argument-hint"] == _BRACKET_HINT
+
+    def test_antigravity_emits_parseable_frontmatter(self, tmp_path: Path, output_root: Path):
+        plugin = _ambiguous_plugin(tmp_path)
+        result = AntigravityAdapter(output_root=output_root).emit_plugin(plugin)
+
+        for path in (p for p in result.written if p.suffix == ".md"):
+            _safe_load_frontmatter(path)
+
+    def test_copilot_preserves_mapping_valued_fields(self, tmp_path: Path, output_root: Path):
+        from tools.tests.conftest import _make_skill
+
+        plugin_dir = tmp_path / "demo"
+        plugin_dir.mkdir()
+        (plugin_dir / ".claude-plugin").mkdir()
+        (plugin_dir / ".claude-plugin" / "plugin.json").write_text('{"name": "demo"}')
+        skill = _make_skill(
+            plugin_dir,
+            "hello",
+            "name: hello\ndescription: Use when greeting.\nmetadata:\n  owner: platform\n  tier: 1",
+            "# Hello\n\nBody.\n",
+        )
+        plugin = PluginSource(
+            name="demo", dir=plugin_dir, plugin_json={"name": "demo"}, skills=[skill]
+        )
+        CopilotAdapter(output_root=output_root).emit_plugin(plugin)
+
+        fm = _safe_load_frontmatter(
+            output_root / ".copilot" / "skills" / "demo__hello" / "SKILL.md"
+        )
+        assert fm["metadata"] == {"owner": "platform", "tier": "1"}
 
 
 # ── Cross-cutting: capabilities consistency ──────────────────────────────────
