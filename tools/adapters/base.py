@@ -257,7 +257,7 @@ _YAML_SPECIAL_LEADS = (
     "-",
 )
 
-# YAML 1.1 implicit booleans/null — must be quoted to avoid being interpreted as bool/None.
+# YAML 1.1 implicit booleans/null, which must be quoted to avoid loading as bool/None.
 # YAML 1.2 narrowed this list, but PyYAML's default is still 1.1 (and many consumers are
 # affected); quote conservatively.
 _YAML_RESERVED_WORDS = frozenset(
@@ -287,6 +287,15 @@ _YAML_RESERVED_WORDS = frozenset(
     }
 )
 
+# Implicit numbers that a leading-digit test misses because they open with `+` or `.`.
+# PyYAML resolves the YAML 1.1 spellings, so `+1` loads as the int 1, `.5` and `.0` as
+# floats, and `.inf`, `.INF`, `+.inf`, `.nan`, `.NaN` as float infinity or not-a-number.
+# YAML 1.2 loaders go further and read a signed bare fraction such as `+.5` as a float
+# too. A string-valued field carrying any of these must be quoted to load back as the
+# string that was written. Values led by `-` are already covered by _YAML_SPECIAL_LEADS.
+# A dot followed by a non-number, `.gitignore` or `.info`, stays bare.
+_YAML_IMPLICIT_NUMBER = re.compile(r"^[-+]?\.?[0-9]|^[-+]?\.(?:inf|Inf|INF|nan|NaN|NAN)$")
+
 
 def yaml_scalar(value: object) -> str:
     """Render a value as a YAML scalar, quoting when needed to avoid ambiguity.
@@ -303,6 +312,7 @@ def yaml_scalar(value: object) -> str:
     - contains ` #` (would be interpreted as a comment)
     - has leading or trailing whitespace
     - starts with a digit (number-like)
+    - is an implicit number led by `+` or `.`, such as `+1`, `.5`, `.inf` or `.nan`
     - matches a YAML 1.1 implicit-boolean/null reserved word
     """
     s = str(value).replace("\n", " ")
@@ -313,6 +323,7 @@ def yaml_scalar(value: object) -> str:
         or ": " in s
         or " #" in s
         or s[:1].isdigit()
+        or _YAML_IMPLICIT_NUMBER.match(s) is not None
         or s in _YAML_RESERVED_WORDS
     )
     if needs_quote:

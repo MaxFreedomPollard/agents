@@ -57,15 +57,22 @@ def _generate_command_toml(description: str, prompt: str) -> str:
     )
 
 
+# Every character YAML treats as structural inside a flow collection. A plain scalar in
+# flow context may not contain any of them, at any position.
+_YAML_FLOW_DELIMITERS = ("[", "]", "{", "}", ",")
+
+
 def _yaml_flow_scalar(value: object) -> str:
     """Render a value as one item of a YAML flow sequence (`[a, b]`).
 
-    Flow sequences use `,` and `]` as structural delimiters, so an item
-    containing either must be quoted even when `yaml_scalar` wouldn't quote
-    it as a bare top-level scalar.
+    Flow sequences use `[`, `]`, `{`, `}` and `,` as structural delimiters, so an item
+    containing any of them must be quoted even when `yaml_scalar` wouldn't quote it as a
+    bare top-level scalar. `yaml_scalar` only rejects those characters in the leading
+    position, which is enough in block context but not here: `a {b` would emit as
+    `[a {b]`, and a YAML parser reads the `{` as the start of a flow mapping and fails.
     """
     s = str(value).replace("\n", " ")
-    if "," in s or "]" in s:
+    if any(delimiter in s for delimiter in _YAML_FLOW_DELIMITERS):
         escaped = s.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return yaml_scalar(s)
